@@ -11,7 +11,7 @@ name, description, personality, scenario, first_mes, mes_example, alternate_gree
 Rules: lorebook holds world details worth injecting only when mentioned (locations, factions, key people, world rules): 0 to 12 concise entries with 2 to 6 trigger keywords each, or an empty array if the conversation covered none. Use {{char}} and {{user}} instead of names where natural. description is detailed prose covering appearance, background and behavior. first_mes is an in-character opening that never speaks or acts for {{user}}. mes_example uses <START> separators and "{{user}}:" / "{{char}}:" lines. Use only what the conversation supports; leave unknown fields as empty strings or empty arrays rather than inventing details.`;
 
 const editInterviewNote = (card) => `\n\nYou are revising an EXISTING character card, not creating a new one. The current card:\n${JSON.stringify(card, null, 2)}\nHelp the user decide what to change or improve; suggest concrete improvements when useful and keep edits consistent with the existing card. Do not rewrite the whole card unless asked.`;
-const editFinalizeNote = (card) => `\n\nThis is an EXISTING card being revised. Current card:\n${JSON.stringify(card, null, 2)}\nOutput the COMPLETE updated card with the same keys. Keep every field the conversation did not change exactly as it is. Always return "lorebook": [].`;
+const editFinalizeNote = (card, saved) => `\n\nThis is an EXISTING card being revised. Current card:\n${JSON.stringify(card, null, 2)}\nOutput the COMPLETE updated card with the same keys. Keep every field the conversation did not change exactly as it is. ${saved ? 'Always return "lorebook": [].' : "Return the complete lorebook: keep the existing entries and apply any changes."}`;
 
 const DRAFT_PATH = "draft.json";
 const SETTINGS_PATH = "settings.json";
@@ -28,23 +28,102 @@ const numOrNull = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null
 const can = (p) => (spindle.permissions?.has ? spindle.permissions.has(p) : true);
 
 // ---------- storage ----------
-async function loadDraft(userId) {
-  if (drafts.has(userId)) return drafts.get(userId);
+const ctxs = new Map(); // userId -> { index, d }
+const newId = () => Math.random().toString(36).slice(2, 9);
+const blankDraft = () => ({ messages: [], card: null, editing: null });
+
+async function readJson(path, userId, fallback = null) {
+  try { return await spindle.userStorage.getJson(path, { fallback, userId }); } catch { return fallback; }
+}
+async function writeJson(path, value, userId) {
+  try { await spindle.userStorage.setJson(path, value, { userId }); }
+  catch (err) { log("warn", `write ${path} failed: ${err.message}`); }
+}
+function draftTitle(d) {
+  if (d.editing?.name) return (d.editing.id ? "Revise: " : "Import: ") + d.editing.name;
+  if (d.card?.name) return d.card.name;
+  const first = d.messages.find((m) => m.role === "user");
+  return first ? first.content.replace(/\s+/g, " ").slice(0, 36) : "New card";
+}
+async function loadCtx(userId) {
+  if (ctxs.has(userId)) return ctxs.get(userId);
+  let index = await readJson("index.json", userId);
   let d = null;
-  try { d = await spindle.userStorage.getJson(DRAFT_PATH, { fallback: null, userId }); } catch {}
-  if (!d || !Array.isArray(d.messages)) d = { messages: [], card: null, editing: null };
+  if (index && Array.isArray(index.items) && index.current) {
+    d = await readJson(`draft-${index.current}.json`, userId);
+  }
+  if (!d || !Array.isArray(d.messages)) {
+    // first run (or migration from the single-draft versions)
+    const legacy = await readJson("draft.json", userId);
+    d = legacy && Array.isArray(legacy.messages) ? legacy : blankDraft();
+    const id = newId();
+    d._id = id;
+    index = { current: id, items: [{ id, title: draftTitle(d), updated: Date.now() }] };
+    await writeJson(`draft-${id}.json`, d, userId);
+    await writeJson("index.json", index, userId);
+  }
   d.editing = d.editing || null;
-  drafts.set(userId, d);
+  d._id = index.current;
+  const st = { index, d };
+  ctxs.set(userId, st);
+  return st;
+}
+async function loadDraft(userId) { return (await loadCtx(userId)).d; }
+async function saveDraft(userId) {
+  const { index, d } = await loadCtx(userId);
+  await writeJson(`draft-${d._id}.json`, d, userId);
+  const it = index.items.find((x) => x.id === d._id);
+  if (it) { it.title = draftTitle(d); it.updated = Date.now(); }
+  await writeJson("index.json", index, userId);
+}
+async function createDraft(userId, init) {
+  const st = await loadCtx(userId);
+  await saveDraft(userId);
+  const d = { ...blankDraft(), ...(init || {}) };
+  d._id = newId();
+  st.index.items.unshift({ id: d._id, title: draftTitle(d), updated: Date.now() });
+  st.index.current = d._id;
+  st.d = d;
+  await saveDraft(userId);
   return d;
 }
-async function saveDraft(userId) {
-  try { await spindle.userStorage.setJson(DRAFT_PATH, drafts.get(userId), { userId }); }
-  catch (err) { log("warn", `draft save failed: ${err.message}`); }
+async function switchDraft(id, userId) {
+  const st = await loadCtx(userId);
+  if (id === st.d._id || !st.index.items.some((x) => x.id === id)) return;
+  await saveDraft(userId);
+  const d = await readJson(`draft-${id}.json`, userId);
+  if (!d || !Array.isArray(d.messages)) {
+    st.index.items = st.index.items.filter((x) => x.id !== id);
+    await writeJson("index.json", st.index, userId);
+    return;
+  }
+  d.editing = d.editing || null;
+  d._id = id;
+  st.d = d;
+  st.index.current = id;
+  await writeJson("index.json", st.index, userId);
+}
+async function deleteDraft(id, userId) {
+  const st = await loadCtx(userId);
+  st.index.items = st.index.items.filter((x) => x.id !== id);
+  try { await spindle.userStorage.delete(`draft-${id}.json`, { userId }); } catch {}
+  if (id === st.d._id) {
+    if (st.index.items.length) {
+      const next = st.index.items[0].id;
+      const d = (await readJson(`draft-${next}.json`, userId)) || blankDraft();
+      d.editing = d.editing || null; d._id = next; st.d = d; st.index.current = next;
+    } else {
+      const d = blankDraft(); d._id = newId(); st.d = d; st.index.current = d._id;
+      st.index.items = [{ id: d._id, title: "New card", updated: Date.now() }];
+      await writeJson(`draft-${d._id}.json`, d, userId);
+    }
+  }
+  await writeJson("index.json", st.index, userId);
 }
 
 const blankSettings = () => ({
   connectionId: null, interviewPrompt: "", finalizePrompt: "", styleNotes: "", temperature: null, maxTokens: null,
-  reasoningMode: "inherit", reasoningEffort: "medium",
+  reasoningMode: "inherit", reasoningEffort: "medium", presets: [], activePreset: "",
 });
 async function loadSettings(userId) {
   if (settingsCache.has(userId)) return settingsCache.get(userId);
@@ -67,6 +146,10 @@ function sanitizeSettings(x) {
     maxTokens: numOrNull(x.maxTokens) ? Math.round(x.maxTokens) : null,
     reasoningMode: modes.includes(x.reasoningMode) ? x.reasoningMode : "inherit",
     reasoningEffort: efforts.includes(x.reasoningEffort) ? x.reasoningEffort : "medium",
+    presets: Array.isArray(x.presets)
+      ? x.presets.slice(0, 20).map((p) => ({ id: str(p?.id) || newId(), name: str(p?.name).trim() || "Preset", text: str(p?.text) })).filter((p) => p.text.trim())
+      : [],
+    activePreset: str(x.activePreset),
   };
 }
 async function pushSettings(userId) {
@@ -176,8 +259,14 @@ const view = (d) => d.messages.map((m) => ({
   swipe: m.swipe || 0, swipes: Array.isArray(m.swipes) ? m.swipes.length : 1,
 }));
 async function pushState(userId) {
-  const d = await loadDraft(userId);
-  send({ type: "state", messages: view(d), card: d.card, editing: d.editing ? { id: d.editing.id, name: d.editing.name } : null }, userId);
+  const { index, d } = await loadCtx(userId);
+  const s = await loadSettings(userId);
+  send({
+    type: "state", messages: view(d), card: d.card,
+    editing: d.editing ? { id: d.editing.id || null, name: d.editing.name, imported: !d.editing.id } : null,
+    drafts: index.items, currentDraft: d._id,
+    presets: (s.presets || []).map((p) => ({ id: p.id, name: p.name })), activePreset: s.activePreset || "",
+  }, userId);
 }
 
 async function runReply(userId, { swipe = false } = {}) {
@@ -254,7 +343,25 @@ async function handleTruncate(index, userId) {
   await pushState(userId);
 }
 
-async function handleFinalize(userId) {
+async function handleDeleteMessage(index, userId) {
+  if (busy.has(userId)) return;
+  const d = await loadDraft(userId);
+  if (!Number.isInteger(index) || index < 0 || index >= d.messages.length) return;
+  const m = d.messages[index];
+  const lastIdx = index === d.messages.length - 1;
+  if (m.role === "assistant" && lastIdx && Array.isArray(m.swipes) && m.swipes.length > 1) {
+    // remove only the version being viewed
+    m.swipes.splice(m.swipe || 0, 1);
+    m.swipe = Math.min(m.swipe || 0, m.swipes.length - 1);
+    m.content = m.swipes[m.swipe].content; m.reasoning = m.swipes[m.swipe].reasoning || "";
+  } else {
+    d.messages.splice(index, 1);
+  }
+  await saveDraft(userId);
+  await pushState(userId);
+}
+
+async function handleFinalize(userId, presetId) {
   if (busy.has(userId)) return;
   const d = await loadDraft(userId);
   if (d.messages.length === 0) {
@@ -267,11 +374,17 @@ async function handleFinalize(userId) {
     const transcript = d.messages.map((m) => `${m.role === "user" ? "USER" : "DESIGNER"}: ${m.content}`).join("\n\n");
     const cfg = await loadSettings(userId);
     let sys = cfg.finalizePrompt.trim() || DEFAULT_FINALIZE_PROMPT;
-    if (d.editing) sys += editFinalizeNote(d.editing.base);
+    if (d.editing) sys += editFinalizeNote(d.editing.base, !!d.editing.id);
     if (cfg.styleNotes.trim()) sys += `\n\nAdditional requirements from the user (follow these):\n${cfg.styleNotes.trim()}`;
+    const preset = (cfg.presets || []).find((p) => p.id === presetId);
+    if (preset) sys += `\n\nStyle preset "${preset.name}" (follow this):\n${preset.text.trim()}`;
+    if ((cfg.activePreset || "") !== (preset?.id || "")) {
+      cfg.activePreset = preset?.id || "";
+      await writeJson(SETTINGS_PATH, cfg, userId);
+    }
     const raw = await generateText([{ role: "system", content: sys }, { role: "user", content: transcript }], userId);
     const card = parseCardJson(raw);
-    if (d.editing) { card.lorebook = []; if (!card.name) card.name = d.editing.name; }
+    if (d.editing) { if (d.editing.id) card.lorebook = []; if (!card.name) card.name = d.editing.name; }
     d.card = card;
     await saveDraft(userId);
     send({ type: "card", card }, userId);
@@ -292,10 +405,15 @@ async function handleSaveCard(card, userId) {
   await saveDraft(userId);
   const { lorebook, ...fields } = dto;
 
-  if (d.editing) {
+  if (d.editing?.id) {
     try {
+      let note = "";
+      try {
+        const old = await spindle.characters.get(d.editing.id, userId);
+        if (old) { await pushBackup(d.editing.id, old, userId); note = "Previous version saved; use History to restore it."; }
+      } catch (err) { log("warn", `backup failed: ${err.message}`); note = "Warning: could not back up the previous version."; }
       await spindle.characters.update(d.editing.id, fields, userId);
-      send({ type: "saved", id: d.editing.id, name: dto.name, updated: true, lorebook: 0, note: "" }, userId);
+      send({ type: "saved", id: d.editing.id, name: dto.name, updated: true, lorebook: 0, note, noteBad: note.startsWith("Warning") }, userId);
     } catch (err) {
       log("error", `characters.update failed: ${err.message}`);
       send({ type: "save_unavailable", reason: err.message }, userId);
@@ -351,12 +469,163 @@ async function handleEditCharacter(id, userId) {
     if (!c) throw new Error("character not found");
     const base = pickCardFields(c);
     base.name = base.name || str(c.name);
-    drafts.set(userId, { messages: [], card: null, editing: { id, name: base.name, base } });
-    await saveDraft(userId);
+    await createDraft(userId, { editing: { id, name: base.name, base } });
     await pushState(userId);
   } catch (err) {
     send({ type: "error", message: `Could not load character: ${err.message}` }, userId);
   }
+}
+
+// ---------- backups (undo for revisions) ----------
+const backupPath = (id) => `backup-${id}.json`;
+async function pushBackup(charId, character, userId) {
+  const list = (await readJson(backupPath(charId), userId, [])) || [];
+  list.unshift({ ts: Date.now(), name: str(character.name), card: pickCardFields(character) });
+  await writeJson(backupPath(charId), list.slice(0, 8), userId);
+}
+async function handleListBackups(charId, userId) {
+  const list = (await readJson(backupPath(charId), userId, [])) || [];
+  send({ type: "backups", charId, list: list.map((x) => ({ ts: x.ts, name: x.name })) }, userId);
+}
+async function handleRestoreBackup(charId, ts, userId) {
+  try {
+    const list = (await readJson(backupPath(charId), userId, [])) || [];
+    const item = list.find((x) => x.ts === ts);
+    if (!item) throw new Error("that backup no longer exists");
+    const cur = await spindle.characters.get(charId, userId);
+    if (cur) await pushBackup(charId, cur, userId); // restoring is itself undoable
+    await spindle.characters.update(charId, item.card, userId);
+    const d = await loadDraft(userId);
+    if (d.editing?.id === charId) { d.editing.base = item.card; d.editing.name = item.card.name || d.editing.name; await saveDraft(userId); }
+    send({ type: "restored", name: item.card.name }, userId);
+    await handleListBackups(charId, userId);
+    await pushState(userId);
+  } catch (err) {
+    send({ type: "error", message: `Restore failed: ${err.message}` }, userId);
+  }
+}
+
+// ---------- rewrite a single field ----------
+const FIELD_HINTS = {
+  alternate_greetings: "Separate greetings with a line containing only ---.",
+  lorebook: "Format per entry: title on the first line, then a line 'Keys: a, b, c', then the content; entries separated by a line containing only ---.",
+  tags: "Comma-separated tags on one line.",
+};
+const stripFences = (t) => t.replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/, "").trim();
+async function handleRewriteField(key, instruction, values, userId) {
+  key = str(key);
+  const ins = str(instruction).trim();
+  if (!key || !ins) return;
+  values = values && typeof values === "object" ? values : {};
+  send({ type: "field_busy", key, value: true }, userId);
+  try {
+    const rest = {};
+    for (const [k, v] of Object.entries(values)) if (k !== key) rest[k] = str(v);
+    const sys = `You are editing ONE field ("${key}") of a roleplay character card. Rewrite only that field according to the user's instruction and keep it consistent with the rest of the card. Keep {{char}} and {{user}} placeholders. ${FIELD_HINTS[key] || ""} Return ONLY the new text of the field in the same format as the current text: no commentary, no label, no code fences.`;
+    const user = `Rest of the card:\n${JSON.stringify(rest, null, 2)}\n\nCurrent "${key}":\n${str(values[key]) || "(empty)"}\n\nInstruction: ${ins}`;
+    const out = stripFences(await generateText([{ role: "system", content: sys }, { role: "user", content: user }], userId));
+    send({ type: "field", key, value: out }, userId);
+  } catch (err) {
+    log("error", `rewrite failed: ${err.message}`);
+    send({ type: "error", message: `Rewrite failed: ${err.message}` }, userId);
+  } finally {
+    send({ type: "field_busy", key, value: false }, userId);
+  }
+}
+
+// ---------- test chat with the finished card ----------
+function characterSystem(card) {
+  card = card || {};
+  const name = str(card.name) || "Character";
+  const sub = (t) => str(t).replaceAll("{{char}}", name).replaceAll("{{user}}", "User").replaceAll("<START>", "---");
+  const parts = [`You are roleplaying as ${name}. Stay fully in character and write only ${name}'s dialogue, actions and narration. Never speak or act for User.`];
+  if (card.system_prompt) parts.push(sub(card.system_prompt));
+  if (card.description) parts.push(`## Description\n${sub(card.description)}`);
+  if (card.personality) parts.push(`## Personality\n${sub(card.personality)}`);
+  if (card.scenario) parts.push(`## Scenario\n${sub(card.scenario)}`);
+  if (card.mes_example) parts.push(`## Example dialogue\n${sub(card.mes_example)}`);
+  if (card.post_history_instructions) parts.push(sub(card.post_history_instructions));
+  return parts.join("\n\n");
+}
+async function handleTestSend(card, messages, userId) {
+  if (busy.has(userId)) return;
+  const history = Array.isArray(messages) ? messages.filter((m) => m && (m.role === "user" || m.role === "assistant")).map((m) => ({ role: m.role, content: str(m.content) })) : [];
+  if (!history.length) return;
+  const ac = new AbortController();
+  aborts.set(userId, ac);
+  busy.add(userId);
+  try {
+    const { text, reasoning, aborted } = await streamText(
+      [{ role: "system", content: characterSystem(card) }, ...history], userId, ac.signal,
+      (t, r) => send({ type: "test_stream", content: t, reasoning: r }, userId),
+    );
+    if (!text && !aborted) throw new Error("empty response from the model");
+    send({ type: "test_done", content: text, reasoning }, userId);
+  } catch (err) {
+    log("error", `test chat failed: ${err.message}`);
+    send({ type: "test_error", message: `Test chat failed: ${err.message}` }, userId);
+  } finally {
+    aborts.delete(userId);
+    busy.delete(userId);
+  }
+}
+
+// ---------- import ----------
+function cardFromImport(c) {
+  c = c && typeof c === "object" ? c : {};
+  const book = c.character_book?.entries || c.lorebook;
+  const lore = Array.isArray(book)
+    ? book.map((e) => ({ comment: str(e?.comment || e?.name), keys: strList(e?.keys || e?.key), content: str(e?.content) })).filter((e) => e.content.trim())
+    : [];
+  return normalizeCard({ ...c, lorebook: lore });
+}
+async function startImportedDraft(card, userId) {
+  const n = cardFromImport(card);
+  await createDraft(userId, { card: n, editing: { id: null, name: n.name || "Imported card", base: n } });
+  await pushState(userId);
+  send({ type: "card", card: n }, userId);
+}
+async function handleImportText(text, userId) {
+  text = str(text).trim().slice(0, 60000);
+  if (!text || busy.has(userId)) return;
+  busy.add(userId);
+  send({ type: "busy", value: true, kind: "import" }, userId);
+  try {
+    const sys = DEFAULT_FINALIZE_PROMPT.replace("Using the conversation below, write the final character card.", "Convert the text below into a character card, keeping its facts and wording as much as possible and adding nothing that is not there.");
+    const raw = await generateText([{ role: "system", content: sys }, { role: "user", content: text }], userId);
+    await startImportedDraft(parseCardJson(raw), userId);
+  } catch (err) {
+    log("error", `import failed: ${err.message}`);
+    send({ type: "error", message: `Import failed: ${err.message}` }, userId);
+  } finally {
+    busy.delete(userId);
+    send({ type: "busy", value: false }, userId);
+  }
+}
+
+// ---------- token counts ----------
+async function handleCountTokens(texts, userId) {
+  texts = texts && typeof texts === "object" ? texts : {};
+  const s = await loadSettings(userId);
+  const opts = { userId };
+  if (s.connectionId) {
+    try { const c = await spindle.connections.get(s.connectionId, userId); if (c?.model) opts.model = c.model; } catch {}
+  }
+  const counts = {};
+  let approximate = false;
+  await Promise.all(Object.entries(texts).map(async ([k, v]) => {
+    const t = str(v);
+    if (!t) { counts[k] = 0; return; }
+    try {
+      const r = await spindle.tokens.countText(t, opts);
+      counts[k] = r.total_tokens;
+      if (r.approximate) approximate = true;
+    } catch {
+      counts[k] = Math.ceil(t.length / 4);
+      approximate = true;
+    }
+  }));
+  send({ type: "tokens", counts, approximate }, userId);
 }
 
 // ---------- routing ----------
@@ -379,16 +648,29 @@ spindle.onFrontendMessage(async (raw, userId) => {
       case "swipe": await handleSwipe(raw.dir, userId); return;
       case "stop": aborts.get(userId)?.abort(); return;
       case "truncate": await handleTruncate(raw.index, userId); return;
-      case "finalize": await handleFinalize(userId); return;
+      case "finalize": await handleFinalize(userId, str(raw.presetId)); return;
+      case "delete_message": await handleDeleteMessage(raw.index, userId); return;
+      case "rewrite_field": await handleRewriteField(raw.key, raw.instruction, raw.values, userId); return;
+      case "test_send": await handleTestSend(raw.card, raw.messages, userId); return;
+      case "import_card": if (!busy.has(userId)) await startImportedDraft(raw.card, userId); return;
+      case "import_text": await handleImportText(raw.text, userId); return;
+      case "count_tokens": await handleCountTokens(raw.texts, userId); return;
+      case "list_backups": await handleListBackups(str(raw.charId), userId); return;
+      case "restore_backup": await handleRestoreBackup(str(raw.charId), raw.ts, userId); return;
+      case "list_drafts": await pushState(userId); return;
+      case "new_draft":
+        if (busy.has(userId)) { send({ type: "error", message: "Wait for the current reply to finish first." }, userId); return; }
+        await createDraft(userId); await pushState(userId); return;
+      case "switch_draft":
+        if (busy.has(userId)) { send({ type: "error", message: "Wait for the current reply to finish first." }, userId); return; }
+        await switchDraft(str(raw.id), userId); await pushState(userId); return;
+      case "delete_draft":
+        if (busy.has(userId)) { send({ type: "error", message: "Wait for the current reply to finish first." }, userId); return; }
+        await deleteDraft(str(raw.id), userId); await pushState(userId); return;
       case "save_card": await handleSaveCard(raw.card, userId); return;
       case "list_characters": await handleListCharacters(userId); return;
       case "edit_character": await handleEditCharacter(str(raw.id), userId); return;
-      case "reset": {
-        drafts.set(userId, { messages: [], card: null, editing: null });
-        await saveDraft(userId);
-        await pushState(userId);
-        return;
-      }
+      case "reset": await createDraft(userId); await pushState(userId); return;
       default: log("warn", `unknown message type ${raw?.type}`);
     }
   } catch (err) {
