@@ -27,7 +27,8 @@ header{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border-botto
 .title{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
 .title b{font-size:15px;letter-spacing:.2px}
 .chip{align-self:flex-start;font-size:11px;padding:1px 8px;border-radius:999px;background:var(--pri-t);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.nav{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.nav button{min-width:0;padding:5px 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nav{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;padding:8px;border:1px solid var(--border);border-radius:var(--r);background:var(--fill)}
+#menu::after{content:" \\25BE"}#menu.open::after{content:" \\25B4"}.nav button{min-width:0;padding:5px 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 main{display:flex;flex-direction:column;flex:1;min-height:0}
 button{font:inherit;color:inherit;cursor:pointer;border:1px solid var(--border);background:var(--fill);border-radius:calc(var(--r) - 2px);padding:6px 11px}
 button:hover:not(:disabled){border-color:var(--pri)}
@@ -107,27 +108,72 @@ const textToLore = (t) => t.split(/\n-{3,}\n/).map((blk) => {
   return { comment, keys, content: lines.join("\n").trim() };
 }).filter((e) => e.content);
 
-// Character cards embedded in PNG files (tEXt chunk "chara" or "ccv3", base64 JSON).
-function pngCardJson(buf) {
+// ---- card file readers: PNG (tEXt / zTXt / iTXt), CHARX (zip with card.json), JSON ----
+async function inflate(bytes, fmt) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(fmt));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+function decodeCardPayload(raw) {
+  raw = raw.trim();
+  try { return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(raw), (c) => c.charCodeAt(0)))); } catch {}
+  return JSON.parse(raw);
+}
+async function pngCardJson(buf) {
   const u = new Uint8Array(buf), dv = new DataView(buf);
-  if (u[0] !== 0x89 || u[1] !== 0x50) return null;
-  const latin = new TextDecoder("latin1");
-  const found = {};
+  const latin = new TextDecoder("latin1"), utf8 = new TextDecoder();
+  const found = {}, chunks = [];
   let p = 8;
   while (p + 8 <= u.length) {
     const len = dv.getUint32(p);
     const type = String.fromCharCode(u[p + 4], u[p + 5], u[p + 6], u[p + 7]);
-    if (type === "tEXt") {
-      const data = u.subarray(p + 8, p + 8 + len), z = data.indexOf(0);
-      if (z > 0) found[latin.decode(data.subarray(0, z))] = latin.decode(data.subarray(z + 1));
-    }
+    if (!chunks.includes(type)) chunks.push(type);
+    const data = u.subarray(p + 8, p + 8 + len);
+    try {
+      if (type === "tEXt") {
+        const z = data.indexOf(0);
+        if (z > 0) found[latin.decode(data.subarray(0, z))] = latin.decode(data.subarray(z + 1));
+      } else if (type === "zTXt") {
+        const z = data.indexOf(0);
+        if (z > 0) found[latin.decode(data.subarray(0, z))] = latin.decode(await inflate(data.subarray(z + 2), "deflate"));
+      } else if (type === "iTXt") {
+        const z = data.indexOf(0);
+        if (z > 0) {
+          const compressed = data[z + 1] === 1;
+          let q = z + 3;
+          q = data.indexOf(0, q) + 1; // language tag
+          q = data.indexOf(0, q) + 1; // translated keyword
+          const body = data.subarray(q);
+          found[latin.decode(data.subarray(0, z))] = compressed ? utf8.decode(await inflate(body, "deflate")) : utf8.decode(body);
+        }
+      }
+    } catch {}
     if (type === "IEND") break;
     p += 12 + len;
   }
   const raw = found.ccv3 || found.chara;
-  if (!raw) return null;
-  const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
-  return JSON.parse(new TextDecoder().decode(bytes));
+  if (!raw) return { error: `This PNG has no embedded character data (it contains: ${chunks.join(", ") || "nothing readable"}).` };
+  try { return { json: decodeCardPayload(raw) }; } catch { return { error: "The character data inside this PNG could not be decoded." }; }
+}
+async function zipEntry(buf, wanted) {
+  const u = new Uint8Array(buf), dv = new DataView(buf);
+  let e = u.length - 22;
+  while (e >= 0 && dv.getUint32(e, true) !== 0x06054b50) e--;
+  if (e < 0) return null;
+  const n = dv.getUint16(e + 10, true);
+  let p = dv.getUint32(e + 16, true);
+  for (let i = 0; i < n; i++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) break;
+    const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);
+    const nlen = dv.getUint16(p + 28, true), xlen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true), lho = dv.getUint32(p + 42, true);
+    const name = new TextDecoder().decode(u.subarray(p + 46, p + 46 + nlen));
+    if (name === wanted) {
+      const start = lho + 30 + dv.getUint16(lho + 26, true) + dv.getUint16(lho + 28, true);
+      const data = u.subarray(start, start + csize);
+      return method === 0 ? data : await inflate(data, "deflate-raw");
+    }
+    p += 46 + nlen + xlen + clen;
+  }
+  return null;
 }
 const unwrapCard = (j) => (j && typeof j === "object" && j.data && typeof j.data === "object" ? j.data : j);
 
@@ -152,8 +198,8 @@ export function setup(ctx) {
   <div class="app" id="app">
     <header>
       <div class="top"><div class="title"><b>Card Forge</b><span class="chip" id="chip" hidden></span></div>
-        <button class="ghost" id="close" ${docked ? "hidden" : ""}>Close</button></div>
-      <div class="nav"><button class="ghost" id="drafts">Drafts</button><button class="ghost" id="pick">Characters</button><button class="ghost" id="imp">Import</button>
+        <button class="ghost" id="menu" aria-expanded="false">Menu</button><button class="ghost" id="close" ${docked ? "hidden" : ""}>Close</button></div>
+      <div class="nav" id="nav" hidden><button class="ghost" id="drafts">Drafts</button><button class="ghost" id="pick">Characters</button><button class="ghost" id="imp">Import</button>
         <button class="ghost" id="hist" hidden>History</button><button class="ghost" id="gear">Settings</button><button class="ghost" id="new">New</button></div>
     </header>
     <main id="chat">
@@ -169,8 +215,8 @@ export function setup(ctx) {
     <main id="draftsview" hidden><div class="pane"><h2>Your drafts</h2><div class="list" id="dlist"></div></div>
       <div class="foot"><button id="draftsback">Back</button><button class="primary" id="draftnew">New draft</button></div></main>
     <main id="importview" hidden><div class="pane"><h2>Import a card</h2>
-      <div class="note">Upload a card file (.png or .json), or paste a character description. The card opens in the editor, and you can keep refining it by chatting.</div>
-      <input type="file" id="file" accept=".json,.png,.txt,.md,application/json,image/png,text/plain">
+      <div class="note">Upload a card file (PNG, JSON or .charx) or a text file, or paste a character description. The card opens in the editor, and you can keep refining it by chatting.</div>
+      <input type="file" id="file">
       <h2>Or paste text</h2><textarea id="paste" rows="9" placeholder="Paste a character description, bio, or notes..."></textarea></div>
       <div class="foot"><button id="impback">Back</button><button class="primary" id="impgo">Convert text to card</button></div></main>
     <main id="histview" hidden><div class="pane"><h2>Previous versions</h2><div class="note">Each update saves the version it replaced. Restoring also saves the current version first.</div><div class="list" id="hlist"></div></div>
@@ -547,17 +593,23 @@ export function setup(ctx) {
   // ---------- import ----------
   async function importFile(file) {
     try {
-      const name = file.name.toLowerCase();
-      if (name.endsWith(".png") || file.type === "image/png") {
-        const j = pngCardJson(await file.arrayBuffer());
-        if (!j) { toast("No character data found in that PNG.", true); return; }
-        send({ type: "import_card", card: unwrapCard(j) });
+      const buf = await file.arrayBuffer();
+      const u = new Uint8Array(buf);
+      if (u[0] === 0x89 && u[1] === 0x50 && u[2] === 0x4e && u[3] === 0x47) {
+        const r = await pngCardJson(buf);
+        if (r.error) { toast(r.error, true); return; }
+        send({ type: "import_card", card: unwrapCard(r.json) });
+      } else if (u[0] === 0x50 && u[1] === 0x4b) {
+        const entry = await zipEntry(buf, "card.json");
+        if (!entry) { toast("This archive has no card.json inside.", true); return; }
+        send({ type: "import_card", card: unwrapCard(JSON.parse(new TextDecoder().decode(entry))) });
       } else {
-        const text = await file.text();
+        const text = new TextDecoder().decode(u);
+        if (text.slice(0, 2000).includes("\u0000")) { toast("Unsupported file type. Use a PNG card, a JSON card, a .charx file, or a text file.", true); return; }
         let j = null;
-        if (name.endsWith(".json") || text.trim().startsWith("{")) { try { j = JSON.parse(text); } catch {} }
+        if (text.trim().startsWith("{")) { try { j = JSON.parse(text); } catch {} }
         if (j) send({ type: "import_card", card: unwrapCard(j) });
-        else send({ type: "import_text", text });
+        else { send({ type: "import_text", text }); toast("Converting text into a card..."); }
       }
     } catch (err) { toast(`Could not read the file: ${err.message}`, true); }
     $("file").value = "";
@@ -577,6 +629,9 @@ export function setup(ctx) {
     fab.onclick = () => { host.style.display = "block"; fab.style.display = "none"; };
     $("close").onclick = () => { host.style.display = "none"; fab.style.display = ""; };
   }
+  function setMenu(open) { $("nav").hidden = !open; $("menu").classList.toggle("open", open); $("menu").setAttribute("aria-expanded", String(open)); }
+  $("menu").onclick = () => setMenu($("nav").hidden);
+  $("nav").addEventListener("click", (e) => { if (e.target.closest("button")) setMenu(false); });
   const coarse = matchMedia("(pointer: coarse)").matches;
   $("send").onclick = sendInput;
   $("input").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !coarse) { e.preventDefault(); sendInput(); } });
