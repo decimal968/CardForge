@@ -90,17 +90,24 @@ async function pushSettings(userId) {
   }, userId);
 }
 
-// GUESS: the exact request shape of generate.raw (connection_id / parameters
-// names). If generation fails, this is the one function to fix.
+// Uses spindle.generate.quiet (documented: the host resolves provider, model and
+// preset from the connection profile). connection_id picks a specific profile;
+// without it the user's active connection is used.
 async function generateText(messages, userId) {
   const s = await loadSettings(userId);
   const parameters = { max_tokens: s.maxTokens || 8000 };
   if (s.temperature !== null) parameters.temperature = s.temperature;
-  const req = { messages, userId, parameters };
+  const req = { messages, parameters, userId };
   if (s.connectionId) req.connection_id = s.connectionId;
-  const res = await spindle.generate.raw(req);
+  let res;
+  try {
+    res = await spindle.generate.quiet(req, userId);
+  } catch (err) {
+    const sent = `connection=${s.connectionId ? "chosen" : "active/default"}`;
+    throw new Error(`${err?.message || err} [${sent}]`);
+  }
   const text = extractText(res).trim();
-  if (!text) throw new Error("empty response from the model");
+  if (!text) throw new Error(`empty response from the model [result type: ${typeof res}]`);
   return text;
 }
 
@@ -131,27 +138,55 @@ async function pushState(userId) {
 
 const busy = new Set();
 
-async function handleSend(content, userId) {
-  const text = str(content).trim();
-  if (!text || busy.has(userId)) return;
-  busy.add(userId);
+async function runReply(userId) {
   const d = await loadDraft(userId);
-  d.messages.push({ role: "user", content: text });
+  busy.add(userId);
   send({ type: "busy", value: true }, userId);
-  await pushState(userId);
   try {
     const cfg = await loadSettings(userId);
-    const reply = await generateText([{ role: "system", content: cfg.interviewPrompt.trim() || DEFAULT_INTERVIEW_PROMPT }, ...d.messages], userId);
+    const sys = cfg.interviewPrompt.trim() || DEFAULT_INTERVIEW_PROMPT;
+    const reply = await generateText([{ role: "system", content: sys }, ...d.messages], userId);
     d.messages.push({ role: "assistant", content: reply });
     await saveDraft(userId);
   } catch (err) {
-    log("error", `send failed: ${err.message}`);
+    log("error", `reply failed: ${err.message}`);
     send({ type: "error", message: `Generation failed: ${err.message}` }, userId);
   } finally {
     busy.delete(userId);
     send({ type: "busy", value: false }, userId);
     await pushState(userId);
   }
+}
+
+async function handleSend(content, userId) {
+  const text = str(content).trim();
+  if (!text || busy.has(userId)) return;
+  const d = await loadDraft(userId);
+  d.messages.push({ role: "user", content: text });
+  await saveDraft(userId);
+  await pushState(userId);
+  await runReply(userId);
+}
+
+// Retry after a failure (last message is the user's) or regenerate the last reply.
+async function handleRetry(userId) {
+  if (busy.has(userId)) return;
+  const d = await loadDraft(userId);
+  if (d.messages.length && d.messages[d.messages.length - 1].role === "assistant") d.messages.pop();
+  if (!d.messages.length) return;
+  await saveDraft(userId);
+  await runReply(userId);
+}
+
+// Edit: drop the message at `index` and everything after it; the frontend
+// puts its text back in the input box.
+async function handleTruncate(index, userId) {
+  if (busy.has(userId)) return;
+  const d = await loadDraft(userId);
+  if (!Number.isInteger(index) || index < 0 || index >= d.messages.length) return;
+  d.messages = d.messages.slice(0, index);
+  await saveDraft(userId);
+  await pushState(userId);
 }
 
 async function handleFinalize(userId) {
@@ -181,8 +216,8 @@ async function handleFinalize(userId) {
   }
 }
 
-// GUESS: characters.create may not exist on every host. If it is missing or
-// fails, the frontend downloads a Character Card V2 JSON instead.
+// characters.create is documented (permission: characters). If it ever fails,
+// the frontend downloads a Character Card V2 JSON instead.
 async function handleSaveCard(card, userId) {
   const dto = normalizeCard(card);
   const d = await loadDraft(userId);
@@ -217,6 +252,8 @@ spindle.onFrontendMessage(async (raw, userId) => {
       }
       case "send": await handleSend(raw.content, userId); return;
       case "finalize": await handleFinalize(userId); return;
+      case "retry": await handleRetry(userId); return;
+      case "truncate": await handleTruncate(raw.index, userId); return;
       case "save_card": await handleSaveCard(raw.card, userId); return;
       case "reset": {
         drafts.set(userId, { messages: [], card: null });
