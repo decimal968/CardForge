@@ -34,7 +34,7 @@ button.primary{background:#2f6f64;border-color:#3f8b7d;color:#fff}
 .msg.assistant{align-self:flex-start;background:#1b2329;font-family:Georgia,serif}
 .hint{color:#8ea3a0;text-align:center;margin:auto;padding:0 20px}
 .bar{display:flex;gap:8px;padding:10px 12px;border-top:1px solid #2a363c;align-items:flex-end}
-textarea,input{width:100%;background:#0c1013;color:inherit;border:1px solid #33434b;border-radius:8px;padding:8px;font:inherit;resize:vertical}
+textarea,input,select{width:100%;background:#0c1013;color:inherit;border:1px solid #33434b;border-radius:8px;padding:8px;font:inherit;resize:vertical}
 .bar textarea{resize:none;min-height:42px;max-height:140px}
 .foot{display:flex;gap:8px;padding:0 12px 10px}
 .foot button{flex:1}
@@ -50,12 +50,17 @@ export function setup(ctx) {
   root.innerHTML = `<style>${CSS}</style>
     <button class="fab" id="fab">Card Forge</button>
     <section class="panel" id="panel">
-      <header><h1>Card Forge</h1><button id="new">New</button><button id="close">Close</button></header>
+      <header><h1>Card Forge</h1><button id="gear">Settings</button><button id="new">New</button><button id="close">Close</button></header>
       <div id="chat" style="display:contents">
         <div class="log" id="log"></div>
         <div class="toast" id="toast1"></div>
         <div class="bar"><textarea id="input" rows="1" placeholder="Describe your character idea..."></textarea><button class="primary" id="send">Send</button></div>
         <div class="foot"><button id="finalize">Finalize card</button></div>
+      </div>
+      <div id="setview" style="display:none;flex:1;min-height:0;flex-direction:column">
+        <div class="card" id="setfields"></div>
+        <div class="toast" id="toast3"></div>
+        <div class="foot"><button id="setback">Cancel</button><button id="setreset">Reset prompts</button><button class="primary" id="setsave">Save</button></div>
       </div>
       <div id="cardview" style="display:none;flex:1;min-height:0;flex-direction:column">
         <div class="card" id="fields"></div>
@@ -66,16 +71,16 @@ export function setup(ctx) {
   document.body.appendChild(host);
   const $ = (id) => root.getElementById(id);
 
-  let messages = [], busy = false, card = null, view = "chat";
+  let messages = [], busy = false, card = null, view = "chat", cfg = null;
 
   function toast(text, err) {
-    for (const id of ["toast1", "toast2"]) {
+    for (const id of ["toast1", "toast2", "toast3"]) {
       const t = $(id);
       t.textContent = text;
       t.className = "toast show" + (err ? " err" : "");
     }
     clearTimeout(toast.t);
-    toast.t = setTimeout(() => { $("toast1").className = "toast"; $("toast2").className = "toast"; }, 7000);
+    toast.t = setTimeout(() => { ["toast1", "toast2", "toast3"].forEach((id) => { $(id).className = "toast"; }); }, 7000);
   }
 
   function renderChat() {
@@ -130,10 +135,68 @@ export function setup(ctx) {
     return out;
   }
 
+
+  function field(label, el) {
+    const w = document.createElement("label");
+    w.textContent = label;
+    w.appendChild(el);
+    return w;
+  }
+
+  function renderSettings() {
+    const box = $("setfields");
+    box.textContent = "";
+    if (!cfg) { box.textContent = "Loading..."; return; }
+    const s = cfg.settings;
+    const sel = document.createElement("select");
+    sel.id = "s_conn";
+    const def = document.createElement("option");
+    def.value = "";
+    def.textContent = "Default connection";
+    sel.appendChild(def);
+    for (const c of cfg.connections) {
+      const o = document.createElement("option");
+      o.value = c.id;
+      o.textContent = `${c.name}${c.model ? " (" + c.model + ")" : ""}${c.is_default ? " [default]" : ""}`;
+      sel.appendChild(o);
+    }
+    sel.value = s.connectionId || "";
+    box.appendChild(field("Connection profile", sel));
+    const num = (id, val, ph, step) => {
+      const i = document.createElement("input");
+      i.id = id; i.type = "number"; i.step = step; i.placeholder = ph;
+      i.value = val === null || val === undefined ? "" : val;
+      return i;
+    };
+    box.appendChild(field("Temperature (blank = connection default)", num("s_temp", s.temperature, "e.g. 0.9", "0.05")));
+    box.appendChild(field("Max response tokens (blank = 8000)", num("s_max", s.maxTokens, "e.g. 8000", "1")));
+    const ta = (id, val, rows) => {
+      const t = document.createElement("textarea");
+      t.id = id; t.rows = rows; t.value = val || "";
+      return t;
+    };
+    box.appendChild(field("Interviewer prompt (how the chat assistant behaves)", ta("s_int", s.interviewPrompt, 10)));
+    box.appendChild(field("Card-writing prompt (used when you press Finalize)", ta("s_fin", s.finalizePrompt, 10)));
+    box.appendChild(field("Extra card requirements (added to the card-writing prompt, e.g. language, length, POV, format)", ta("s_style", s.styleNotes, 4)));
+  }
+
+  function readSettings() {
+    const n = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
+    return {
+      connectionId: $("s_conn").value || null,
+      temperature: n("s_temp"),
+      maxTokens: n("s_max"),
+      interviewPrompt: $("s_int").value,
+      finalizePrompt: $("s_fin").value,
+      styleNotes: $("s_style").value,
+    };
+  }
+
   function setView(v) {
     view = v;
     $("chat").style.display = v === "chat" ? "contents" : "none";
     $("cardview").style.display = v === "card" ? "flex" : "none";
+    $("setview").style.display = v === "settings" ? "flex" : "none";
   }
 
   function downloadV2(c) {
@@ -168,6 +231,15 @@ export function setup(ctx) {
     }
   };
   $("back").onclick = () => setView("chat");
+  $("gear").onclick = () => { setView("settings"); renderSettings(); ctx.sendToBackend({ type: "get_settings" }); };
+  $("setback").onclick = () => setView("chat");
+  $("setreset").onclick = () => {
+    if (!cfg) return;
+    $("s_int").value = cfg.defaults.interviewPrompt;
+    $("s_fin").value = cfg.defaults.finalizePrompt;
+    toast("Prompts reset to defaults. Press Save to keep that.");
+  };
+  $("setsave").onclick = () => { if (cfg) ctx.sendToBackend({ type: "save_settings", settings: readSettings() }); };
   $("dl").onclick = () => downloadV2(readCard());
   $("save").onclick = () => ctx.sendToBackend({ type: "save_card", card: readCard() });
 
@@ -175,6 +247,8 @@ export function setup(ctx) {
     switch (msg?.type) {
       case "state": messages = msg.messages || []; card = msg.card || card; renderChat(); break;
       case "busy": busy = !!msg.value; renderChat(); break;
+      case "settings": cfg = msg; if (view === "settings") renderSettings(); break;
+      case "settings_saved": toast("Settings saved."); setView("chat"); break;
       case "card": card = msg.card; renderCard(); setView("card"); break;
       case "error": toast(msg.message, true); break;
       case "saved": toast(`Saved "${msg.name || "character"}" to Lumiverse.`); break;

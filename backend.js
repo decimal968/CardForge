@@ -1,11 +1,11 @@
 // Card Forge backend. Plain ESM, no build step. `spindle` is a host global.
 
-const INTERVIEW_PROMPT = `You are Card Forge, a collaborative designer of roleplay character cards.
+const DEFAULT_INTERVIEW_PROMPT = `You are Card Forge, a collaborative designer of roleplay character cards.
 Talk naturally with the user about the character they want. After each message, respond with one to three focused questions or concrete suggestions about whatever is still undecided: identity, appearance, personality and flaws, speech style, backstory, relationship to {{user}}, setting and scenario, the opening message, content boundaries.
 Do not ask everything at once. Do not write the whole card unless asked; short draft snippets of single parts are fine when they help. Use {{char}} and {{user}} for names.
 When the character feels complete, say so and suggest pressing "Finalize card".`;
 
-const FINALIZE_PROMPT = `Using the conversation below, write the final character card.
+const DEFAULT_FINALIZE_PROMPT = `Using the conversation below, write the final character card.
 Output ONLY one JSON object, no commentary and no code fences, with exactly these keys:
 name, description, personality, scenario, first_mes, mes_example, alternate_greetings (array of strings), system_prompt, post_history_instructions, creator_notes, tags (array of strings).
 Rules: use {{char}} and {{user}} instead of names where natural. description is detailed prose covering appearance, background and behavior. first_mes is an in-character opening that never speaks or acts for {{user}}. mes_example uses <START> separators and "{{user}}:" / "{{char}}:" lines. Use only what the conversation supports; leave unknown fields as empty strings or empty arrays rather than inventing details.`;
@@ -41,10 +41,64 @@ function extractText(res) {
   return "";
 }
 
-// GUESS: the exact request shape of generate.raw. If generation fails, this is
-// the one function to fix.
+const SETTINGS_PATH = "settings.json";
+const settingsCache = new Map();
+const blankSettings = () => ({
+  connectionId: null, interviewPrompt: "", finalizePrompt: "", styleNotes: "", temperature: null, maxTokens: null,
+});
+
+async function loadSettings(userId) {
+  if (settingsCache.has(userId)) return settingsCache.get(userId);
+  let s = null;
+  try { s = await spindle.userStorage.getJson(SETTINGS_PATH, { fallback: null, userId }); } catch {}
+  s = { ...blankSettings(), ...(s && typeof s === "object" ? s : {}) };
+  settingsCache.set(userId, s);
+  return s;
+}
+
+const numOrNull = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+
+function sanitizeSettings(x) {
+  x = x && typeof x === "object" ? x : {};
+  const clean = (v, def) => (str(v).trim() === def.trim() ? "" : str(v));
+  return {
+    connectionId: str(x.connectionId) || null,
+    interviewPrompt: clean(x.interviewPrompt, DEFAULT_INTERVIEW_PROMPT),
+    finalizePrompt: clean(x.finalizePrompt, DEFAULT_FINALIZE_PROMPT),
+    styleNotes: str(x.styleNotes),
+    temperature: numOrNull(x.temperature),
+    maxTokens: numOrNull(x.maxTokens) ? Math.round(x.maxTokens) : null,
+  };
+}
+
+async function pushSettings(userId) {
+  const s = await loadSettings(userId);
+  let connections = [];
+  try {
+    const list = await spindle.connections.list(userId);
+    connections = list.map((c) => ({ id: c.id, name: c.name, provider: c.provider, model: c.model ?? "", is_default: !!c.is_default }));
+  } catch (err) { log("warn", `connections.list failed: ${err.message}`); }
+  send({
+    type: "settings",
+    settings: {
+      ...s,
+      interviewPrompt: s.interviewPrompt.trim() || DEFAULT_INTERVIEW_PROMPT,
+      finalizePrompt: s.finalizePrompt.trim() || DEFAULT_FINALIZE_PROMPT,
+    },
+    defaults: { interviewPrompt: DEFAULT_INTERVIEW_PROMPT, finalizePrompt: DEFAULT_FINALIZE_PROMPT },
+    connections,
+  }, userId);
+}
+
+// GUESS: the exact request shape of generate.raw (connection_id / parameters
+// names). If generation fails, this is the one function to fix.
 async function generateText(messages, userId) {
-  const res = await spindle.generate.raw({ messages, userId });
+  const s = await loadSettings(userId);
+  const parameters = { max_tokens: s.maxTokens || 8000 };
+  if (s.temperature !== null) parameters.temperature = s.temperature;
+  const req = { messages, userId, parameters };
+  if (s.connectionId) req.connection_id = s.connectionId;
+  const res = await spindle.generate.raw(req);
   const text = extractText(res).trim();
   if (!text) throw new Error("empty response from the model");
   return text;
@@ -86,7 +140,8 @@ async function handleSend(content, userId) {
   send({ type: "busy", value: true }, userId);
   await pushState(userId);
   try {
-    const reply = await generateText([{ role: "system", content: INTERVIEW_PROMPT }, ...d.messages], userId);
+    const cfg = await loadSettings(userId);
+    const reply = await generateText([{ role: "system", content: cfg.interviewPrompt.trim() || DEFAULT_INTERVIEW_PROMPT }, ...d.messages], userId);
     d.messages.push({ role: "assistant", content: reply });
     await saveDraft(userId);
   } catch (err) {
@@ -110,10 +165,10 @@ async function handleFinalize(userId) {
   send({ type: "busy", value: true }, userId);
   try {
     const transcript = d.messages.map((m) => `${m.role === "user" ? "USER" : "DESIGNER"}: ${m.content}`).join("\n\n");
-    const raw = await generateText(
-      [{ role: "system", content: FINALIZE_PROMPT }, { role: "user", content: transcript }],
-      userId,
-    );
+    const cfg = await loadSettings(userId);
+    let sys = cfg.finalizePrompt.trim() || DEFAULT_FINALIZE_PROMPT;
+    if (cfg.styleNotes.trim()) sys += `\n\nAdditional requirements from the user (follow these):\n${cfg.styleNotes.trim()}`;
+    const raw = await generateText([{ role: "system", content: sys }, { role: "user", content: transcript }], userId);
     d.card = parseCardJson(raw);
     await saveDraft(userId);
     send({ type: "card", card: d.card }, userId);
@@ -151,6 +206,15 @@ spindle.onFrontendMessage(async (raw, userId) => {
   try {
     switch (raw?.type) {
       case "ready": await pushState(userId); return;
+      case "get_settings": await pushSettings(userId); return;
+      case "save_settings": {
+        const s = sanitizeSettings(raw.settings);
+        settingsCache.set(userId, s);
+        try { await spindle.userStorage.setJson(SETTINGS_PATH, s, { userId }); }
+        catch (err) { log("warn", `settings save failed: ${err.message}`); }
+        send({ type: "settings_saved" }, userId);
+        return;
+      }
       case "send": await handleSend(raw.content, userId); return;
       case "finalize": await handleFinalize(userId); return;
       case "save_card": await handleSaveCard(raw.card, userId); return;
