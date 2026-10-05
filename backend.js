@@ -7,8 +7,8 @@ When the character feels complete, say so and suggest pressing "Finalize card".`
 
 const DEFAULT_FINALIZE_PROMPT = `Using the conversation below, write the final character card.
 Output ONLY one JSON object, no commentary and no code fences, with exactly these keys:
-name, description, personality, scenario, first_mes, mes_example, alternate_greetings (array of strings), system_prompt, post_history_instructions, creator_notes, tags (array of strings).
-Rules: use {{char}} and {{user}} instead of names where natural. description is detailed prose covering appearance, background and behavior. first_mes is an in-character opening that never speaks or acts for {{user}}. mes_example uses <START> separators and "{{user}}:" / "{{char}}:" lines. Use only what the conversation supports; leave unknown fields as empty strings or empty arrays rather than inventing details.`;
+name, description, personality, scenario, first_mes, mes_example, alternate_greetings (array of strings), system_prompt, post_history_instructions, creator_notes, tags (array of strings), lorebook (array of objects, each with comment, keys (array of strings) and content).
+Rules: lorebook holds world details worth injecting only when mentioned (locations, factions, key people, world rules): 0 to 12 concise entries with 2 to 6 trigger keywords each, or an empty array if the conversation covered none. use {{char}} and {{user}} instead of names where natural. description is detailed prose covering appearance, background and behavior. first_mes is an in-character opening that never speaks or acts for {{user}}. mes_example uses <START> separators and "{{user}}:" / "{{char}}:" lines. Use only what the conversation supports; leave unknown fields as empty strings or empty arrays rather than inventing details.`;
 
 const DRAFT_PATH = "draft.json";
 const drafts = new Map();
@@ -93,10 +93,15 @@ async function pushSettings(userId) {
 // Uses spindle.generate.quiet (documented: the host resolves provider, model and
 // preset from the connection profile). connection_id picks a specific profile;
 // without it the user's active connection is used.
-async function generateText(messages, userId) {
-  const s = await loadSettings(userId);
+function buildParams(s) {
   const parameters = { max_tokens: s.maxTokens || 8000 };
   if (s.temperature !== null) parameters.temperature = s.temperature;
+  return parameters;
+}
+
+async function generateText(messages, userId) {
+  const s = await loadSettings(userId);
+  const parameters = buildParams(s);
   const req = { messages, parameters, userId };
   if (s.connectionId) req.connection_id = s.connectionId;
   let res;
@@ -111,6 +116,33 @@ async function generateText(messages, userId) {
   return text;
 }
 
+
+const aborts = new Map();
+
+// Streams a reply (documented quietStream). Falls back to a normal call if
+// streaming fails before any token arrives.
+async function streamText(messages, userId, signal, onPartial) {
+  const s = await loadSettings(userId);
+  const req = { messages, parameters: buildParams(s), userId, signal };
+  if (s.connectionId) req.connection_id = s.connectionId;
+  let acc = "", last = 0;
+  try {
+    for await (const chunk of spindle.generate.quietStream(req, userId)) {
+      if (chunk.type === "token" && chunk.token) {
+        acc += chunk.token;
+        const now = Date.now();
+        if (now - last > 120) { last = now; onPartial(acc); }
+      } else if (chunk.type === "done" && !acc && chunk.content) acc = chunk.content;
+    }
+  } catch (err) {
+    if (signal.aborted) return { text: acc.trim(), aborted: true };
+    if (!acc) return { text: await generateText(messages, userId), aborted: false };
+    throw err;
+  }
+  onPartial(acc);
+  return { text: acc.trim(), aborted: false };
+}
+
 const str = (v) => (typeof v === "string" ? v : "");
 const strList = (v) => (Array.isArray(v) ? v.map(str).map((s) => s.trim()).filter(Boolean) : []);
 
@@ -122,6 +154,9 @@ function normalizeCard(c) {
     alternate_greetings: strList(c.alternate_greetings), system_prompt: str(c.system_prompt),
     post_history_instructions: str(c.post_history_instructions), creator_notes: str(c.creator_notes),
     tags: strList(c.tags),
+    lorebook: Array.isArray(c.lorebook)
+      ? c.lorebook.map((e) => ({ comment: str(e?.comment), keys: strList(e?.keys), content: str(e?.content) })).filter((e) => e.content.trim())
+      : [],
   };
 }
 
@@ -140,18 +175,25 @@ const busy = new Set();
 
 async function runReply(userId) {
   const d = await loadDraft(userId);
+  const ac = new AbortController();
+  aborts.set(userId, ac);
   busy.add(userId);
-  send({ type: "busy", value: true }, userId);
+  send({ type: "busy", value: true, kind: "reply" }, userId);
   try {
     const cfg = await loadSettings(userId);
     const sys = cfg.interviewPrompt.trim() || DEFAULT_INTERVIEW_PROMPT;
-    const reply = await generateText([{ role: "system", content: sys }, ...d.messages], userId);
-    d.messages.push({ role: "assistant", content: reply });
+    const { text, aborted } = await streamText(
+      [{ role: "system", content: sys }, ...d.messages], userId, ac.signal,
+      (t) => send({ type: "stream", content: t }, userId),
+    );
+    if (!text && !aborted) throw new Error("empty response from the model");
+    if (text) d.messages.push({ role: "assistant", content: text });
     await saveDraft(userId);
   } catch (err) {
     log("error", `reply failed: ${err.message}`);
     send({ type: "error", message: `Generation failed: ${err.message}` }, userId);
   } finally {
+    aborts.delete(userId);
     busy.delete(userId);
     send({ type: "busy", value: false }, userId);
     await pushState(userId);
@@ -197,7 +239,7 @@ async function handleFinalize(userId) {
     return;
   }
   busy.add(userId);
-  send({ type: "busy", value: true }, userId);
+  send({ type: "busy", value: true, kind: "finalize" }, userId);
   try {
     const transcript = d.messages.map((m) => `${m.role === "user" ? "USER" : "DESIGNER"}: ${m.content}`).join("\n\n");
     const cfg = await loadSettings(userId);
@@ -227,9 +269,31 @@ async function handleSaveCard(card, userId) {
     send({ type: "save_unavailable", reason: "this Lumiverse build has no characters.create" }, userId);
     return;
   }
+  const can = (p) => (spindle.permissions?.has ? spindle.permissions.has(p) : true);
+  const { lorebook, ...fields } = dto;
+  let bookId = null, note = "";
+  if (lorebook.length) {
+    if (!can("world_books")) {
+      note = "Lorebook not saved: grant the World Books permission to Card Forge in the Extensions panel.";
+    } else {
+      try {
+        const book = await spindle.world_books.create(
+          { name: `${dto.name || "Character"} Lorebook`, description: "Generated by Card Forge" }, userId);
+        for (const e of lorebook) {
+          await spindle.world_books.entries.create(book.id, {
+            key: e.keys, content: e.content, comment: e.comment, position: 0, selective: false, constant: false,
+          }, userId);
+        }
+        bookId = book.id;
+      } catch (err) {
+        log("error", `lorebook create failed: ${err.message}`);
+        note = `Lorebook not saved: ${err.message}`;
+      }
+    }
+  }
   try {
-    const made = await spindle.characters.create(dto, userId);
-    send({ type: "saved", id: made?.id ?? null, name: dto.name }, userId);
+    const made = await spindle.characters.create({ ...fields, ...(bookId ? { world_book_ids: [bookId] } : {}) }, userId);
+    send({ type: "saved", id: made?.id ?? null, name: dto.name, lorebook: bookId ? lorebook.length : 0, note }, userId);
   } catch (err) {
     log("error", `characters.create failed: ${err.message}`);
     send({ type: "save_unavailable", reason: err.message }, userId);
@@ -253,6 +317,7 @@ spindle.onFrontendMessage(async (raw, userId) => {
       case "send": await handleSend(raw.content, userId); return;
       case "finalize": await handleFinalize(userId); return;
       case "retry": await handleRetry(userId); return;
+      case "stop": aborts.get(userId)?.abort(); return;
       case "truncate": await handleTruncate(raw.index, userId); return;
       case "save_card": await handleSaveCard(raw.card, userId); return;
       case "reset": {

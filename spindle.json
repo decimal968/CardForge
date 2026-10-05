@@ -1,10 +1,10 @@
 {
-  "version": "0.3.0",
+  "version": "0.4.0",
   "name": "Card Forge",
   "identifier": "cardforge",
   "author": "you",
   "description": "Chat-based character card builder: talk through your idea, then generate the finished card.",
-  "permissions": ["generation", "characters"],
+  "permissions": ["generation", "characters", "world_books"],
   "entry_backend": "backend.js",
   "entry_frontend": "frontend.js",
   "minimum_lumiverse_version": "1.2.0"
