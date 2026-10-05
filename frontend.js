@@ -40,6 +40,9 @@ textarea,input,select{width:100%;background:#0c1013;color:inherit;border:1px sol
 .foot button{flex:1}
 .card{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
 .card label{display:flex;flex-direction:column;gap:4px;color:#9fb4b0;font-size:12px}
+.tools{display:flex;gap:6px;margin-top:-6px}.tools.user{align-self:flex-end}.tools.assistant{align-self:flex-start}
+.tools button{font-size:12px;padding:2px 9px;background:transparent;color:#8ea3a0;border-color:#2a363c}
+.errbox{background:#3a1f22;color:#f0b9bd;border-radius:10px;padding:9px 12px;font-size:13px;user-select:text;white-space:pre-wrap;word-break:break-word}
 .toast{margin:0 12px 8px;padding:8px 10px;border-radius:8px;background:#2b2a1a;color:#efe3a4;font-size:13px;display:none}
 .toast.show{display:block}.toast.err{background:#3a1f22;color:#f0b9bd}
 `;
@@ -71,7 +74,7 @@ export function setup(ctx) {
   document.body.appendChild(host);
   const $ = (id) => root.getElementById(id);
 
-  let messages = [], busy = false, card = null, view = "chat", cfg = null;
+  let messages = [], busy = false, card = null, view = "chat", cfg = null, errorText = "";
 
   function toast(text, err) {
     for (const id of ["toast1", "toast2", "toast3"]) {
@@ -83,25 +86,52 @@ export function setup(ctx) {
     toast.t = setTimeout(() => { ["toast1", "toast2", "toast3"].forEach((id) => { $(id).className = "toast"; }); }, 7000);
   }
 
+  function mkBtn(label, fn) {
+    const bt = document.createElement("button");
+    bt.textContent = label;
+    bt.onclick = fn;
+    return bt;
+  }
+
   function renderChat() {
     const log = $("log");
     log.textContent = "";
-    if (messages.length === 0) {
+    if (messages.length === 0 && !errorText) {
       const h = document.createElement("div");
       h.className = "hint";
       h.textContent = "Tell me your character idea, even a single sentence. I'll ask questions until it's ready, then press Finalize card.";
       log.appendChild(h);
     }
-    for (const m of messages) {
+    messages.forEach((m, i) => {
       const d = document.createElement("div");
       d.className = "msg " + m.role;
       d.textContent = m.content;
       log.appendChild(d);
-    }
+      if (busy) return;
+      const last = i === messages.length - 1;
+      const row = document.createElement("div");
+      row.className = "tools " + m.role;
+      if (m.role === "user") {
+        row.appendChild(mkBtn("Edit", () => {
+          $("input").value = m.content;
+          ctx.sendToBackend({ type: "truncate", index: i });
+          $("input").focus();
+        }));
+        if (last) row.appendChild(mkBtn("Retry", () => ctx.sendToBackend({ type: "retry" })));
+      } else if (last) {
+        row.appendChild(mkBtn("Regenerate", () => ctx.sendToBackend({ type: "retry" })));
+      }
+      if (row.childNodes.length) log.appendChild(row);
+    });
     if (busy) {
       const d = document.createElement("div");
       d.className = "msg assistant";
       d.textContent = "...";
+      log.appendChild(d);
+    } else if (errorText) {
+      const d = document.createElement("div");
+      d.className = "errbox";
+      d.textContent = errorText;
       log.appendChild(d);
     }
     log.scrollTop = log.scrollHeight;
@@ -246,11 +276,11 @@ export function setup(ctx) {
   const off = ctx.onBackendMessage((msg) => {
     switch (msg?.type) {
       case "state": messages = msg.messages || []; card = msg.card || card; renderChat(); break;
-      case "busy": busy = !!msg.value; renderChat(); break;
+      case "busy": busy = !!msg.value; if (busy) errorText = ""; renderChat(); break;
       case "settings": cfg = msg; if (view === "settings") renderSettings(); break;
       case "settings_saved": toast("Settings saved."); setView("chat"); break;
       case "card": card = msg.card; renderCard(); setView("card"); break;
-      case "error": toast(msg.message, true); break;
+      case "error": errorText = msg.message; if (view !== "chat") toast(msg.message, true); renderChat(); break;
       case "saved": toast(`Saved "${msg.name || "character"}" to Lumiverse.`); break;
       case "save_unavailable":
         toast(`Couldn't save directly (${msg.reason}). Downloaded a card file instead; import it in Lumiverse.`, true);
