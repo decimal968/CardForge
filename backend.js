@@ -3,12 +3,39 @@
 const DEFAULT_INTERVIEW_PROMPT = `You are Card Forge, a collaborative designer of roleplay character cards.
 Talk naturally with the user about the character they want. After each message, respond with one to three focused questions or concrete suggestions about whatever is still undecided: identity, appearance, personality and flaws, speech style, backstory, relationship to {{user}}, setting and scenario, the opening message, content boundaries.
 Do not ask everything at once. Do not write the whole card unless asked; short draft snippets of single parts are fine when they help. Use {{char}} and {{user}} for names.
-When the character feels complete, say so and suggest pressing "Finalize card".`;
+When the character feels complete, say so and suggest pressing "Finalize card".
+End every reply with one last line in exactly this format, with nothing after it:
+Suggestions: first option | second option | third option
+Give 2 or 3 short follow-ups (under 12 words each) written from the user's point of view, which the user could tap to send as their next message, for example: Give her a dry sense of humor.`;
+
+const CARD_SCHEMA = `Output ONLY one JSON object, no commentary and no code fences, with exactly these keys:
+name, description, personality, scenario, first_mes, mes_example, alternate_greetings (array of strings), system_prompt, post_history_instructions, creator_notes, tags (array of strings), lorebook (array of objects, each with comment, keys (array of strings) and content).`;
 
 const DEFAULT_FINALIZE_PROMPT = `Using the conversation below, write the final character card.
-Output ONLY one JSON object, no commentary and no code fences, with exactly these keys:
-name, description, personality, scenario, first_mes, mes_example, alternate_greetings (array of strings), system_prompt, post_history_instructions, creator_notes, tags (array of strings), lorebook (array of objects, each with comment, keys (array of strings) and content).
-Rules: lorebook holds world details worth injecting only when mentioned (locations, factions, key people, world rules): 0 to 12 concise entries with 2 to 6 trigger keywords each, or an empty array if the conversation covered none. Use {{char}} and {{user}} instead of names where natural. description is detailed prose covering appearance, background and behavior. first_mes is an in-character opening that never speaks or acts for {{user}}. mes_example uses <START> separators and "{{user}}:" / "{{char}}:" lines. Use only what the conversation supports; leave unknown fields as empty strings or empty arrays rather than inventing details.`;
+${CARD_SCHEMA}
+Writing guidelines:
+- Use {{char}} and {{user}} instead of names where natural. Use only what the conversation supports; leave unknown fields as empty strings or empty arrays rather than inventing details.
+- description: detailed prose covering appearance, background and behavior.
+- personality: focus on contradictions, drives and defense mechanisms rather than a list of adjectives.
+- scenario: the situation and the relationship at the start.
+- first_mes: a vivid in-character opening that sets the scene with sensory detail. Never describe {{user}}'s reactions, movements, thoughts or dialogue. End on an open hook that leaves the initiative with {{user}}.
+- alternate_greetings: only if the conversation asked for them or they clearly help; give different starting situations, not rewordings of the same scene, at most 3.
+- mes_example: two or three <START> blocks with "{{user}}:" and "{{char}}:" lines showing contrast (one casual, one tense or vulnerable), including how {{char}} reacts to interruptions, teasing or silence, with distinctive speech habits and physical tells.
+- lorebook: 0 to 8 concise entries, only for world details worth injecting when mentioned (locations, factions, key people, artifacts, world rules). Each has a clear title as comment, 2 to 6 specific trigger keys (proper nouns, titles or uncommon terms, never common words like "eyes" or "magic") and standalone content. Return an empty array if the conversation covered none.`;
+
+const IMPORT_PROMPT = `Convert the text below into a character card, keeping its facts and wording as much as possible and adding nothing that is not there.
+${CARD_SCHEMA}
+Use {{char}} and {{user}} instead of names where natural. Leave fields the text does not cover as empty strings or empty arrays.`;
+
+// Built-in style presets (always available next to Finalize).
+const BUILTIN_PRESETS = [
+  { id: "builtin:prose", name: "Natural prose", text: "Write description and personality as flowing natural prose paragraphs, with no bullet lists or tag lists. Prefer concrete behavior and psychology over adjectives." },
+  { id: "builtin:markdown", name: "Markdown sections", text: "Format description with markdown headers (### Physical Traits, ### Personality, ### Background, ### Motivations, ### Speech and Mannerisms) and short bullet points under each header, so different traits stay clearly separated." },
+  { id: "builtin:wpp", name: "W++ / AliChat", text: 'Format description and personality in compact W++ / AliChat pseudocode, for example [Character("Name"){ Species("human") Mind("cynical" + "dry humor") Likes("rain") }]. Keep first_mes, scenario and mes_example as normal prose.' },
+  { id: "builtin:concise", name: "Concise (token-efficient)", text: "Be token-efficient: description under about 400 words, personality under 80 words, mes_example a single short <START> block, and no filler." },
+  { id: "builtin:slowburn", name: "Slow-burn drama", text: "Tone: slow-burn emotional drama. Emphasize guarded emotions, subtext, restraint and gradual trust; first_mes should start in a quiet, charged situation rather than a dramatic event." },
+];
+const findPreset = (cfg, id) => BUILTIN_PRESETS.find((p) => p.id === id) || (cfg.presets || []).find((p) => p.id === id);
 
 const editInterviewNote = (card) => `\n\nYou are revising an EXISTING character card, not creating a new one. The current card:\n${JSON.stringify(card, null, 2)}\nHelp the user decide what to change or improve; suggest concrete improvements when useful and keep edits consistent with the existing card. Do not rewrite the whole card unless asked.`;
 const editFinalizeNote = (card, saved) => `\n\nThis is an EXISTING card being revised. Current card:\n${JSON.stringify(card, null, 2)}\nOutput the COMPLETE updated card with the same keys. Keep every field the conversation did not change exactly as it is. ${saved ? 'Always return "lorebook": [].' : "Return the complete lorebook: keep the existing entries and apply any changes."}`;
@@ -17,8 +44,24 @@ const DRAFT_PATH = "draft.json";
 const SETTINGS_PATH = "settings.json";
 const drafts = new Map();
 const settingsCache = new Map();
-const aborts = new Map();
+const aborts = new Map(); // userId -> Set<AbortController>
 const busy = new Set();
+const seq = new Map();
+const kinds = new Map();
+const IDLE_MS = Number(globalThis.__cardforgeIdleMs) || 120000;  // no output from the model
+const TOTAL_MS = Number(globalThis.__cardforgeTotalMs) || 300000; // non-streaming call limit
+function track(userId) {
+  const ac = new AbortController();
+  if (!aborts.has(userId)) aborts.set(userId, new Set());
+  aborts.get(userId).add(ac);
+  return { ac, release: () => aborts.get(userId)?.delete(ac) };
+}
+const abortAll = (userId) => { for (const ac of aborts.get(userId) || []) ac.abort(); };
+function markBusy(userId, kind) {
+  busy.add(userId); kinds.set(userId, kind); seq.set(userId, (seq.get(userId) || 0) + 1);
+  send({ type: "busy", value: true, kind }, userId);
+}
+const cancelled = (err) => !!err?.cancelled;
 
 const log = (level, msg) => spindle.log[level](`[cardforge] ${msg}`);
 const send = (msg, userId) => spindle.sendToFrontend(msg, userId);
@@ -188,24 +231,54 @@ function buildReq(messages, s, userId, signal) {
   return req;
 }
 
-async function generateText(messages, userId) {
+// Rejects on abort (cancelled) or timeout, even if the host ignores the signal.
+function raceAbort(promise, signal, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(Object.assign(new Error("The model took too long to respond. Try again or choose a different connection."), { timeout: true })), ms);
+    const onAbort = () => reject(Object.assign(new Error("Cancelled."), { cancelled: true }));
+    if (signal) {
+      if (signal.aborted) { clearTimeout(timer); return onAbort(); }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    promise.then(resolve, reject).finally(() => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); });
+  });
+}
+
+async function generateText(messages, userId, signal) {
   const s = await loadSettings(userId);
   let res;
-  try { res = await spindle.generate.quiet(buildReq(messages, s, userId), userId); }
-  catch (err) { throw new Error(`${err?.message || err} [connection=${s.connectionId ? "chosen" : "active/default"}]`); }
+  try {
+    res = await raceAbort(spindle.generate.quiet(buildReq(messages, s, userId, signal), userId), signal, TOTAL_MS);
+  } catch (err) {
+    if (err.cancelled || err.timeout) throw err;
+    throw new Error(`${err?.message || err} [connection=${s.connectionId ? "chosen" : "active/default"}]`);
+  }
   const text = extractText(res).trim();
   if (!text) throw new Error(`empty response from the model [result type: ${typeof res}]`);
   return text;
 }
 
-// Streams via quietStream; collects reasoning separately. Falls back to a normal
-// call if streaming fails before any token arrives.
+// Streams via quietStream; collects reasoning separately. Cancellable, with an idle
+// watchdog. Falls back to a normal call if streaming fails before any output.
 async function streamText(messages, userId, signal, onPartial) {
   const s = await loadSettings(userId);
-  const req = buildReq(messages, s, userId, signal);
+  const inner = new AbortController();
+  let timedOut = false, userAbort = false, timer;
+  const onAbort = () => { userAbort = true; inner.abort(); };
+  signal.addEventListener("abort", onAbort, { once: true });
+  const stopped = new Promise((res) => inner.signal.addEventListener("abort", res, { once: true }));
+  const arm = () => { clearTimeout(timer); timer = setTimeout(() => { timedOut = true; inner.abort(); }, IDLE_MS); };
   let text = "", reasoning = "", last = 0;
   try {
-    for await (const chunk of spindle.generate.quietStream(req, userId)) {
+    if (signal.aborted) onAbort();
+    arm();
+    const it = spindle.generate.quietStream(buildReq(messages, s, userId, inner.signal), userId)[Symbol.asyncIterator]();
+    while (!inner.signal.aborted) {
+      const r = await Promise.race([it.next(), stopped.then(() => ({ stopped: true }))]);
+      if (r.stopped) { try { it.return?.(); } catch {} break; }
+      if (r.done) break;
+      arm();
+      const chunk = r.value;
       if (chunk.type === "token" && chunk.token) text += chunk.token;
       else if (chunk.type === "reasoning" && chunk.token) reasoning += chunk.token;
       else if (chunk.type === "done") {
@@ -216,10 +289,19 @@ async function streamText(messages, userId, signal, onPartial) {
       if (now - last > 120) { last = now; onPartial(text, reasoning); }
     }
   } catch (err) {
-    if (signal.aborted) return { text: text.trim(), reasoning: reasoning.trim(), aborted: true };
-    if (!text && !reasoning) return { text: await generateText(messages, userId), reasoning: "", aborted: false };
-    throw err;
+    if (!userAbort && !timedOut) {
+      if (!text && !reasoning) {
+        clearTimeout(timer);
+        return { text: await generateText(messages, userId, signal), reasoning: "", aborted: false };
+      }
+      throw err;
+    }
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
   }
+  if (timedOut) throw new Error("The model stopped responding (no output for 2 minutes). Try again or choose a different connection.");
+  if (userAbort) return { text: text.trim(), reasoning: reasoning.trim(), aborted: true };
   onPartial(text, reasoning);
   return { text: text.trim(), reasoning: reasoning.trim(), aborted: false };
 }
@@ -265,16 +347,15 @@ async function pushState(userId) {
     type: "state", messages: view(d), card: d.card,
     editing: d.editing ? { id: d.editing.id || null, name: d.editing.name, imported: !d.editing.id } : null,
     drafts: index.items, currentDraft: d._id,
-    presets: (s.presets || []).map((p) => ({ id: p.id, name: p.name })), activePreset: s.activePreset || "",
+    presets: [...BUILTIN_PRESETS, ...(s.presets || [])].map((p) => ({ id: p.id, name: p.name })), activePreset: s.activePreset || "",
+    busy: busy.has(userId), busyKind: busy.has(userId) ? kinds.get(userId) || "" : "",
   }, userId);
 }
 
 async function runReply(userId, { swipe = false } = {}) {
   const d = await loadDraft(userId);
-  const ac = new AbortController();
-  aborts.set(userId, ac);
-  busy.add(userId);
-  send({ type: "busy", value: true, kind: "reply" }, userId);
+  const { ac, release } = track(userId);
+  markBusy(userId, "reply");
   try {
     const cfg = await loadSettings(userId);
     let sys = cfg.interviewPrompt.trim() || DEFAULT_INTERVIEW_PROMPT;
@@ -297,9 +378,9 @@ async function runReply(userId, { swipe = false } = {}) {
     await saveDraft(userId);
   } catch (err) {
     log("error", `reply failed: ${err.message}`);
-    send({ type: "error", message: `Generation failed: ${err.message}` }, userId);
+    if (!cancelled(err)) send({ type: "error", message: `Generation failed: ${err.message}` }, userId);
   } finally {
-    aborts.delete(userId);
+    release();
     busy.delete(userId);
     send({ type: "busy", value: false }, userId);
     await pushState(userId);
@@ -368,30 +449,40 @@ async function handleFinalize(userId, presetId) {
     send({ type: "error", message: "Talk about your character first, then finalize." }, userId);
     return;
   }
-  busy.add(userId);
-  send({ type: "busy", value: true, kind: "finalize" }, userId);
+  const { ac, release } = track(userId);
+  markBusy(userId, "finalize");
   try {
     const transcript = d.messages.map((m) => `${m.role === "user" ? "USER" : "DESIGNER"}: ${m.content}`).join("\n\n");
     const cfg = await loadSettings(userId);
     let sys = cfg.finalizePrompt.trim() || DEFAULT_FINALIZE_PROMPT;
     if (d.editing) sys += editFinalizeNote(d.editing.base, !!d.editing.id);
     if (cfg.styleNotes.trim()) sys += `\n\nAdditional requirements from the user (follow these):\n${cfg.styleNotes.trim()}`;
-    const preset = (cfg.presets || []).find((p) => p.id === presetId);
+    const preset = findPreset(cfg, presetId);
     if (preset) sys += `\n\nStyle preset "${preset.name}" (follow this):\n${preset.text.trim()}`;
     if ((cfg.activePreset || "") !== (preset?.id || "")) {
       cfg.activePreset = preset?.id || "";
       await writeJson(SETTINGS_PATH, cfg, userId);
     }
-    const raw = await generateText([{ role: "system", content: sys }, { role: "user", content: transcript }], userId);
-    const card = parseCardJson(raw);
-    if (d.editing) { if (d.editing.id) card.lorebook = []; if (!card.name) card.name = d.editing.name; }
-    d.card = card;
-    await saveDraft(userId);
-    send({ type: "card", card }, userId);
+    const { text, aborted } = await streamText(
+      [{ role: "system", content: sys }, { role: "user", content: transcript }], userId, ac.signal,
+      (t, r) => send({ type: "stream", content: t, reasoning: r }, userId),
+    );
+    if (aborted) {
+      send({ type: "notice", message: "Stopped. No card was made." }, userId);
+    } else {
+      if (!text) throw new Error("empty response from the model");
+      const card = parseCardJson(text);
+      if (d.editing) { if (d.editing.id) card.lorebook = []; if (!card.name) card.name = d.editing.name; }
+      d.card = card;
+      await saveDraft(userId);
+      send({ type: "card", card }, userId);
+    }
   } catch (err) {
     log("error", `finalize failed: ${err.message}`);
-    send({ type: "error", message: `Could not build the card: ${err.message}` }, userId);
+    if (cancelled(err)) send({ type: "notice", message: "Stopped. No card was made." }, userId);
+    else send({ type: "error", message: `Could not build the card: ${err.message}` }, userId);
   } finally {
+    release();
     busy.delete(userId);
     send({ type: "busy", value: false }, userId);
   }
@@ -518,17 +609,19 @@ async function handleRewriteField(key, instruction, values, userId) {
   if (!key || !ins) return;
   values = values && typeof values === "object" ? values : {};
   send({ type: "field_busy", key, value: true }, userId);
+  const { ac, release } = track(userId);
   try {
     const rest = {};
     for (const [k, v] of Object.entries(values)) if (k !== key) rest[k] = str(v);
     const sys = `You are editing ONE field ("${key}") of a roleplay character card. Rewrite only that field according to the user's instruction and keep it consistent with the rest of the card. Keep {{char}} and {{user}} placeholders. ${FIELD_HINTS[key] || ""} Return ONLY the new text of the field in the same format as the current text: no commentary, no label, no code fences.`;
     const user = `Rest of the card:\n${JSON.stringify(rest, null, 2)}\n\nCurrent "${key}":\n${str(values[key]) || "(empty)"}\n\nInstruction: ${ins}`;
-    const out = stripFences(await generateText([{ role: "system", content: sys }, { role: "user", content: user }], userId));
+    const out = stripFences(await generateText([{ role: "system", content: sys }, { role: "user", content: user }], userId, ac.signal));
     send({ type: "field", key, value: out }, userId);
   } catch (err) {
     log("error", `rewrite failed: ${err.message}`);
-    send({ type: "error", message: `Rewrite failed: ${err.message}` }, userId);
+    if (!cancelled(err)) send({ type: "error", message: `Rewrite failed: ${err.message}` }, userId);
   } finally {
+    release();
     send({ type: "field_busy", key, value: false }, userId);
   }
 }
@@ -551,9 +644,8 @@ async function handleTestSend(card, messages, userId) {
   if (busy.has(userId)) return;
   const history = Array.isArray(messages) ? messages.filter((m) => m && (m.role === "user" || m.role === "assistant")).map((m) => ({ role: m.role, content: str(m.content) })) : [];
   if (!history.length) return;
-  const ac = new AbortController();
-  aborts.set(userId, ac);
-  busy.add(userId);
+  const { ac, release } = track(userId);
+  busy.add(userId); kinds.set(userId, "test"); seq.set(userId, (seq.get(userId) || 0) + 1);
   try {
     const { text, reasoning, aborted } = await streamText(
       [{ role: "system", content: characterSystem(card) }, ...history], userId, ac.signal,
@@ -563,9 +655,10 @@ async function handleTestSend(card, messages, userId) {
     send({ type: "test_done", content: text, reasoning }, userId);
   } catch (err) {
     log("error", `test chat failed: ${err.message}`);
-    send({ type: "test_error", message: `Test chat failed: ${err.message}` }, userId);
+    if (cancelled(err)) send({ type: "test_done", content: "", reasoning: "" }, userId);
+    else send({ type: "test_error", message: `Test chat failed: ${err.message}` }, userId);
   } finally {
-    aborts.delete(userId);
+    release();
     busy.delete(userId);
   }
 }
@@ -588,16 +681,17 @@ async function startImportedDraft(card, userId) {
 async function handleImportText(text, userId) {
   text = str(text).trim().slice(0, 60000);
   if (!text || busy.has(userId)) return;
-  busy.add(userId);
-  send({ type: "busy", value: true, kind: "import" }, userId);
+  const { ac, release } = track(userId);
+  markBusy(userId, "import");
   try {
-    const sys = DEFAULT_FINALIZE_PROMPT.replace("Using the conversation below, write the final character card.", "Convert the text below into a character card, keeping its facts and wording as much as possible and adding nothing that is not there.");
-    const raw = await generateText([{ role: "system", content: sys }, { role: "user", content: text }], userId);
+    const raw = await generateText([{ role: "system", content: IMPORT_PROMPT }, { role: "user", content: text }], userId, ac.signal);
     await startImportedDraft(parseCardJson(raw), userId);
   } catch (err) {
     log("error", `import failed: ${err.message}`);
-    send({ type: "error", message: `Import failed: ${err.message}` }, userId);
+    if (cancelled(err)) send({ type: "notice", message: "Stopped. Nothing was imported." }, userId);
+    else send({ type: "error", message: `Import failed: ${err.message}` }, userId);
   } finally {
+    release();
     busy.delete(userId);
     send({ type: "busy", value: false }, userId);
   }
@@ -646,7 +740,18 @@ spindle.onFrontendMessage(async (raw, userId) => {
       case "send": await handleSend(raw.content, userId); return;
       case "retry": await handleRetry(userId); return;
       case "swipe": await handleSwipe(raw.dir, userId); return;
-      case "stop": aborts.get(userId)?.abort(); return;
+      case "stop": {
+        abortAll(userId);
+        const n = seq.get(userId);
+        setTimeout(() => {
+          if (busy.has(userId) && seq.get(userId) === n) { // host ignored the cancel: release the UI anyway
+            busy.delete(userId);
+            send({ type: "busy", value: false }, userId);
+            pushState(userId).catch(() => {});
+          }
+        }, 4000);
+        return;
+      }
       case "truncate": await handleTruncate(raw.index, userId); return;
       case "finalize": await handleFinalize(userId, str(raw.presetId)); return;
       case "delete_message": await handleDeleteMessage(raw.index, userId); return;

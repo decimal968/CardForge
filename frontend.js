@@ -57,6 +57,8 @@ select option{background:var(--elev);color:var(--text)}
 details.think{font-size:12.5px;color:var(--muted);max-width:100%}
 details.think summary{cursor:pointer;user-select:none;color:var(--dim)}
 details.think .tt{margin-top:4px;padding:7px 10px;border-left:2px solid var(--border);white-space:pre-wrap;max-height:240px;overflow:auto}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chips button{border-radius:999px;font-size:12.5px;padding:4px 11px;background:var(--pri-t);border-color:var(--pri);text-align:left}
 .acts{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
 .acts button{font-size:12px;padding:1px 8px;background:transparent;color:var(--dim);border-color:transparent}
 .acts button:hover:not(:disabled){color:var(--text);border-color:var(--border)}
@@ -177,6 +179,15 @@ async function zipEntry(buf, wanted) {
 }
 const unwrapCard = (j) => (j && typeof j === "object" && j.data && typeof j.data === "object" ? j.data : j);
 
+function splitSug(text) {
+  text = text || "";
+  const m = /\n?[ \t]*Suggestions:[ \t]*([^\n]+)[ \t]*$/i.exec(text);
+  if (!m) return { body: text, chips: [] };
+  const chips = m[1].split("|").map((x) => x.trim().replace(/^[-*\d.\s]+/, "")).filter(Boolean).slice(0, 4);
+  return { body: text.slice(0, m.index).trimEnd(), chips };
+}
+const hideSug = (t) => { const i = (t || "").search(/\n?[ \t]*Suggestions:/i); return i >= 0 ? t.slice(0, i).trimEnd() : t || ""; };
+
 const SCREENS = ["chat", "pick", "set", "card", "drafts", "import", "hist", "test"];
 
 export function setup(ctx) {
@@ -292,7 +303,8 @@ export function setup(ctx) {
       const row = el("div", "row " + m.role);
       if (m.role === "assistant" && m.reasoning) row.appendChild(thinkBlock("m" + i, m.reasoning, false));
       const b = el("div", "bubble " + m.role);
-      b.innerHTML = md(m.content);
+      const sp = m.role === "assistant" ? splitSug(m.content) : { body: m.content, chips: [] };
+      b.innerHTML = md(sp.body);
       row.appendChild(b);
       if (!busy) {
         const acts = el("div", "acts");
@@ -300,7 +312,7 @@ export function setup(ctx) {
           acts.appendChild(mkBtn("Edit", () => { $("input").value = m.content; send({ type: "truncate", index: i }); $("input").focus(); }));
           if (last) acts.appendChild(mkBtn("Retry", () => send({ type: "retry" })));
         } else {
-          acts.appendChild(mkBtn("Copy", () => copyText(m.content)));
+          acts.appendChild(mkBtn("Copy", () => copyText(sp.body)));
           if (last) {
             if (m.swipes > 1) {
               const p = mkBtn("<", () => send({ type: "swipe", dir: -1 })); p.disabled = m.swipe <= 0;
@@ -312,15 +324,22 @@ export function setup(ctx) {
         }
         acts.appendChild(mkBtn(last && m.role === "assistant" && m.swipes > 1 ? "Delete version" : "Delete", () => send({ type: "delete_message", index: i })));
         row.appendChild(acts);
+        if (last && m.role === "assistant" && sp.chips.length) {
+          const chips = el("div", "chips");
+          for (const c of sp.chips) chips.appendChild(mkBtn(c, () => send({ type: "send", content: c })));
+          row.appendChild(chips);
+        }
       }
       log.appendChild(row);
     });
     if (typing) {
       const row = el("div", "row assistant");
-      if (busyKind === "reply" && live.reasoning) row.appendChild(thinkBlock("live", live.reasoning, !live.text));
+      if ((busyKind === "reply" || busyKind === "finalize") && live.reasoning) row.appendChild(thinkBlock("live", live.reasoning, !live.text));
       const b = el("div", "bubble assistant");
-      if (busyKind === "finalize") { b.textContent = "Writing the card"; b.classList.add("dots"); }
-      else if (live.text) b.innerHTML = md(live.text);
+      if (busyKind === "finalize") {
+        b.textContent = live.text ? `Writing the card (${live.text.length} characters so far)` : (live.reasoning ? "Thinking" : "Writing the card");
+        b.classList.add("dots");
+      } else if (live.text) b.innerHTML = md(hideSug(live.text));
       else { b.textContent = live.reasoning ? "Thinking" : "Writing"; b.classList.add("dots"); }
       row.appendChild(b);
       log.appendChild(row);
@@ -332,7 +351,7 @@ export function setup(ctx) {
     err.textContent = errorText;
 
     const sb = $("send");
-    if (busy) { sb.textContent = "Stop"; sb.className = "stop"; sb.disabled = busyKind !== "reply"; }
+    if (busy) { sb.textContent = "Stop"; sb.className = "stop"; sb.disabled = false; }
     else { sb.textContent = "Send"; sb.className = "primary"; sb.disabled = false; }
     $("finalize").textContent = editing ? "Generate updated card" : "Finalize card";
     $("finalize").disabled = busy || messages.length === 0;
@@ -340,12 +359,13 @@ export function setup(ctx) {
     $("chip").hidden = !editing;
     $("chip").textContent = editing ? `${editing.imported ? "Imported" : "Editing"}: ${editing.name}` : "";
     $("hist").hidden = !(editing && editing.id);
-    $("impgo").disabled = busy;
+    $("impgo").textContent = busy && busyKind === "import" ? "Stop" : "Convert text to card";
+    $("impgo").disabled = busy && busyKind !== "import";
 
     const ps = $("preset");
     ps.hidden = !presets.length;
     ps.textContent = "";
-    ps.appendChild(Object.assign(el("option", "", "No style preset"), { value: "" }));
+    ps.appendChild(Object.assign(el("option", "", "Style: none"), { value: "" }));
     for (const p of presets) ps.appendChild(Object.assign(el("option", "", p.name), { value: p.id }));
     ps.value = presets.some((p) => p.id === activePreset) ? activePreset : "";
   }
@@ -617,7 +637,7 @@ export function setup(ctx) {
 
   // ---------- wiring ----------
   function sendInput() {
-    if (busy) { if (busyKind === "reply") send({ type: "stop" }); return; }
+    if (busy) { send({ type: "stop" }); return; }
     const text = $("input").value.trim();
     if (!text) return;
     $("input").value = ""; $("input").style.height = "";
@@ -655,7 +675,7 @@ export function setup(ctx) {
   $("imp").onclick = () => show("import");
   $("impback").onclick = () => show("chat");
   $("file").onchange = () => { const f = $("file").files[0]; if (f) importFile(f); };
-  $("impgo").onclick = () => { const t = $("paste").value.trim(); if (!t) { toast("Paste some text first.", true); return; } send({ type: "import_text", text: t }); toast("Converting text into a card..."); };
+  $("impgo").onclick = () => { if (busy && busyKind === "import") { send({ type: "stop" }); return; } const t = $("paste").value.trim(); if (!t) { toast("Paste some text first.", true); return; } send({ type: "import_text", text: t }); toast("Converting text into a card..."); };
   $("hist").onclick = () => { if (!editing?.id) return; backups = null; renderHistory(); show("hist"); send({ type: "list_backups", charId: editing.id }); };
   $("histback").onclick = () => show("chat");
   $("gear").onclick = () => { renderSettings(); show("set"); send({ type: "get_settings" }); };
@@ -671,8 +691,10 @@ export function setup(ctx) {
       case "state":
         messages = msg.messages || []; card = msg.card || null; editing = msg.editing || null;
         drafts = msg.drafts || drafts; currentDraft = msg.currentDraft || currentDraft; presets = msg.presets || []; activePreset = msg.activePreset || "";
+        if (typeof msg.busy === "boolean") { busy = msg.busy; busyKind = msg.busyKind || ""; }
         renderChat(); if (screen === "drafts") renderDrafts(); break;
       case "busy": busy = !!msg.value; busyKind = msg.kind || ""; if (busy) { errorText = ""; live = { text: "", reasoning: "" }; } renderChat(); break;
+      case "notice": toast(msg.message); break;
       case "stream": live = { text: msg.content || "", reasoning: msg.reasoning || "" }; renderChat(); break;
       case "characters": characters = msg.list || []; if (screen === "pick") renderPicker(); break;
       case "backups": backups = msg.list || []; if (screen === "hist") renderHistory(); break;
